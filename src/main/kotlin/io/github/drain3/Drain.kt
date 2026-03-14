@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Kotlin port of the Drain algorithm for log parsing.
 // Based on https://github.com/logpai/Drain3
+// Optimized for memory efficiency and throughput.
 
 package io.github.drain3
 
@@ -15,50 +16,84 @@ class LogCluster(
     var size: Int = 1
 
     @JsonIgnore
-    fun getTemplate(): String = logTemplateTokens.joinToString(" ")
+    fun getTemplate(): String {
+        val tokens = logTemplateTokens
+        val n = tokens.size
+        if (n == 0) return ""
+        if (n == 1) return tokens[0]
+        // Estimate capacity: tokens + spaces
+        val sb = StringBuilder(n * 8)
+        sb.append(tokens[0])
+        for (i in 1 until n) {
+            sb.append(' ').append(tokens[i])
+        }
+        return sb.toString()
+    }
 
     override fun toString(): String =
         "ID=${clusterId.toString().padEnd(5)} : size=${size.toString().padEnd(10)}: ${getTemplate()}"
 }
 
 /**
- * LRU cache that allows callers to conditionally skip cache eviction algorithm when accessing elements.
- * Uses LinkedHashMap with access order.
+ * LRU cache with O(1) non-evicting reads.
+ *
+ * Uses a dual-map design:
+ * - readMap: plain HashMap for O(1) lookups that don't update LRU order
+ * - lruMap: access-order LinkedHashMap for LRU tracking and eviction
+ *
+ * The original implementation used `cache.entries.find {}` which was O(n) — a critical bottleneck
+ * since `get()` is called per candidate cluster in every `fastMatch`.
  */
 class LogClusterCache(private val maxSize: Int) {
-    private val cache = object : LinkedHashMap<Int, LogCluster>(maxSize, 0.75f, true) {
+    private val readMap = HashMap<Int, LogCluster>(maxSize * 4 / 3 + 1)
+    private val lruMap = object : LinkedHashMap<Int, LogCluster>(maxSize * 4 / 3 + 1, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, LogCluster>?): Boolean {
-            return size > maxSize
+            if (size > maxSize) {
+                readMap.remove(eldest!!.key)
+                return true
+            }
+            return false
         }
     }
 
-    /**
-     * Get without updating LRU order (read-only access for matching).
-     */
-    fun get(key: Int): LogCluster? = cache.entries.find { it.key == key }?.value
+    /** O(1) read without updating LRU order — safe for matching candidates. */
+    fun get(key: Int): LogCluster? = readMap[key]
 
     operator fun set(key: Int, value: LogCluster) {
-        cache[key] = value
+        lruMap[key] = value
+        readMap[key] = value
     }
 
-    /**
-     * Access that updates LRU order (touch).
-     */
-    fun touch(key: Int): LogCluster? = cache[key]
+    /** Access that updates LRU order (touch). */
+    fun touch(key: Int): LogCluster? = lruMap[key]
 
-    operator fun contains(key: Int): Boolean = cache.containsKey(key)
+    operator fun contains(key: Int): Boolean = readMap.containsKey(key)
 
-    val values: Collection<LogCluster> get() = cache.values
-    val keys: Set<Int> get() = cache.keys
-    val size: Int get() = cache.size
-
-    fun isEmpty(): Boolean = cache.isEmpty()
-    fun isNotEmpty(): Boolean = cache.isNotEmpty()
+    val values: Collection<LogCluster> get() = readMap.values
+    val keys: Set<Int> get() = readMap.keys
+    val size: Int get() = readMap.size
 }
 
 class Node {
-    val keyToChildNode: MutableMap<String, Node> = mutableMapOf()
-    var clusterIds: MutableList<Int> = mutableListOf()
+    var keyToChildNode: MutableMap<String, Node> = HashMap(4)
+    var clusterIds: IntArray = EMPTY_INT_ARRAY
+
+    fun addClusterId(id: Int) {
+        val old = clusterIds
+        val new = IntArray(old.size + 1)
+        old.copyInto(new)
+        new[old.size] = id
+        clusterIds = new
+    }
+
+    @JsonIgnore
+    fun replaceClusterIds(ids: List<Int>) {
+        clusterIds = ids.toIntArray()
+    }
+
+    companion object {
+        private val EMPTY_INT_ARRAY = IntArray(0)
+    }
 }
 
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -74,9 +109,8 @@ class Drain(
 ) {
     val maxNodeDepth: Int = depth - 2
 
-    // Plain map when maxClusters is null, LRU cache otherwise
     @JsonIgnore
-    private var _idToClusterMap: MutableMap<Int, LogCluster>? = if (maxClusters == null) mutableMapOf() else null
+    private var _idToClusterMap: MutableMap<Int, LogCluster>? = if (maxClusters == null) HashMap() else null
     @JsonIgnore
     private var _idToClusterCache: LogClusterCache? = if (maxClusters != null) LogClusterCache(maxClusters) else null
 
@@ -84,20 +118,26 @@ class Drain(
 
     var rootNode: Node = Node()
 
+    // Pre-compiled regex for tokenization
+    @JsonIgnore
+    private val whitespaceRegex = WHITESPACE_PATTERN
+
+    // Cache small int-to-string conversions (token counts 0-255)
+    @JsonIgnore
+    private val intStringCache = INT_STRING_CACHE
+
     /** Serializable view of id-to-cluster mapping for Jackson. */
     @Suppress("unused")
     var clusterMap: Map<Int, LogCluster>
         get() = if (_idToClusterMap != null) _idToClusterMap!! else {
-            val map = mutableMapOf<Int, LogCluster>()
+            val map = HashMap<Int, LogCluster>()
             _idToClusterCache?.values?.forEach { map[it.clusterId] = it }
             map
         }
         set(value) {
-            // Called during deserialization — repopulate internal storage
             if (_idToClusterMap == null && _idToClusterCache == null) {
-                // Both null during deserialization, initialize based on maxClusters
                 if (maxClusters == null) {
-                    _idToClusterMap = mutableMapOf()
+                    _idToClusterMap = HashMap()
                 } else {
                     _idToClusterCache = LogClusterCache(maxClusters)
                 }
@@ -116,60 +156,62 @@ class Drain(
     val clusters: Collection<LogCluster>
         get() = _idToClusterMap?.values ?: _idToClusterCache!!.values
 
+    // Inline accessors — avoid inner class dispatch overhead
+    private fun clusterGet(key: Int): LogCluster? =
+        _idToClusterMap?.get(key) ?: _idToClusterCache?.get(key)
+
+    private fun clusterSet(key: Int, value: LogCluster) {
+        if (_idToClusterMap != null) _idToClusterMap!![key] = value
+        else _idToClusterCache!![key] = value
+    }
+
+    private fun clusterTouch(key: Int) {
+        _idToClusterCache?.touch(key)
+    }
+
+    private fun clusterContains(key: Int): Boolean =
+        if (_idToClusterMap != null) _idToClusterMap!!.containsKey(key) else _idToClusterCache!!.contains(key)
+
     @get:JsonIgnore
     val idToCluster: IdToClusterAccessor = IdToClusterAccessor()
 
-    /**
-     * Provides a unified accessor for both map and cache storage modes.
-     */
     inner class IdToClusterAccessor {
-        fun get(key: Int): LogCluster? {
-            return _idToClusterMap?.get(key) ?: _idToClusterCache?.get(key)
-        }
-
-        operator fun set(key: Int, value: LogCluster) {
-            if (_idToClusterMap != null) {
-                _idToClusterMap!![key] = value
-            } else {
-                _idToClusterCache!![key] = value
-            }
-        }
-
-        fun touch(key: Int) {
-            if (_idToClusterCache != null) {
-                _idToClusterCache!!.touch(key)
-            }
-            // no-op for plain map
-        }
-
-        operator fun contains(key: Int): Boolean {
-            return if (_idToClusterMap != null) key in _idToClusterMap!! else key in _idToClusterCache!!
-        }
-
-        val values: Collection<LogCluster>
-            get() = _idToClusterMap?.values ?: _idToClusterCache!!.values
-
-        val keys: Set<Int>
-            get() = _idToClusterMap?.keys ?: _idToClusterCache!!.keys
-
-        val size: Int
-            get() = _idToClusterMap?.size ?: _idToClusterCache!!.size
+        fun get(key: Int): LogCluster? = clusterGet(key)
+        operator fun set(key: Int, value: LogCluster) = clusterSet(key, value)
+        fun touch(key: Int) = clusterTouch(key)
+        operator fun contains(key: Int): Boolean = clusterContains(key)
+        val values: Collection<LogCluster> get() = clusters
+        val keys: Set<Int> get() = _idToClusterMap?.keys ?: _idToClusterCache!!.keys
+        val size: Int get() = _idToClusterMap?.size ?: _idToClusterCache!!.size
     }
 
     companion object {
-        fun hasNumbers(s: String): Boolean = s.any { it.isDigit() }
+        private val WHITESPACE_PATTERN = "\\s+".toRegex()
+
+        // Cache int-to-string for common token counts
+        private val INT_STRING_CACHE = Array(256) { it.toString() }
+
+        @JvmStatic
+        fun hasNumbers(s: String): Boolean {
+            for (i in s.indices) {
+                if (s[i] in '0'..'9') return true
+            }
+            return false
+        }
+
+        private fun intToString(i: Int): String =
+            if (i < 256) INT_STRING_CACHE[i] else i.toString()
     }
 
     fun treeSearch(rootNode: Node, tokens: List<String>, simTh: Double, includeParams: Boolean): LogCluster? {
         val tokenCount = tokens.size
-        var curNode = rootNode.keyToChildNode[tokenCount.toString()] ?: return null
+        val curNodeInitial = rootNode.keyToChildNode[intToString(tokenCount)] ?: return null
 
-        // handle case of empty log string
         if (tokenCount == 0) {
-            return idToCluster.get(curNode.clusterIds[0])
+            return clusterGet(curNodeInitial.clusterIds[0])
         }
 
-        // find the leaf node for this log
+        var curNode = curNodeInitial
         var curNodeDepth = 1
         for (token in tokens) {
             if (curNodeDepth >= maxNodeDepth) break
@@ -187,27 +229,29 @@ class Drain(
     }
 
     fun addSeqToPrefixTree(rootNode: Node, cluster: LogCluster) {
-        val tokenCount = cluster.logTemplateTokens.size
-        val tokenCountStr = tokenCount.toString()
+        val tokens = cluster.logTemplateTokens
+        val tokenCount = tokens.size
+        val tokenCountStr = intToString(tokenCount)
 
         val firstLayerNode = rootNode.keyToChildNode.getOrPut(tokenCountStr) { Node() }
         var curNode = firstLayerNode
 
-        // handle case of empty log string
         if (tokenCount == 0) {
-            curNode.clusterIds = mutableListOf(cluster.clusterId)
+            curNode.clusterIds = intArrayOf(cluster.clusterId)
             return
         }
 
         var currentDepth = 1
-        for (token in cluster.logTemplateTokens) {
+        for (token in tokens) {
             if (currentDepth >= maxNodeDepth || currentDepth >= tokenCount) {
-                // clean up stale clusters before adding a new one
-                val newClusterIds = curNode.clusterIds
-                    .filter { it in idToCluster }
-                    .toMutableList()
-                newClusterIds.add(cluster.clusterId)
-                curNode.clusterIds = newClusterIds
+                // Clean up stale clusters + add new one
+                val oldIds = curNode.clusterIds
+                val valid = ArrayList<Int>(oldIds.size + 1)
+                for (id in oldIds) {
+                    if (clusterContains(id)) valid.add(id)
+                }
+                valid.add(cluster.clusterId)
+                curNode.replaceClusterIds(valid)
                 break
             }
 
@@ -252,34 +296,35 @@ class Drain(
         }
     }
 
-    fun getSeqDistance(seq1: List<String>, seq2: List<String>, includeParams: Boolean): Pair<Double, Int> {
-        require(seq1.size == seq2.size)
-
-        if (seq1.isEmpty()) return 1.0 to 0
+    /**
+     * Calculate sequence distance without allocating Pair objects.
+     * Returns similarity packed into high bits and paramCount in low bits of a Long.
+     * Use [unpackSimilarity] and [unpackParamCount] to extract.
+     */
+    fun getSeqDistancePacked(seq1: List<String>, seq2: List<String>, includeParams: Boolean): Long {
+        val n = seq1.size
+        if (n == 0) return packResult(1.0, 0)
 
         var simTokens = 0
         var paramCount = 0
 
-        for ((token1, token2) in seq1.zip(seq2)) {
-            if (token1 == paramStr) {
+        for (i in 0 until n) {
+            val t1 = seq1[i]
+            if (t1 === paramStr || t1 == paramStr) { // identity check first
                 paramCount++
                 continue
             }
-            if (token1 == token2) {
+            if (t1 == seq2[i]) {
                 simTokens++
             }
         }
 
-        if (includeParams) {
-            simTokens += paramCount
-        }
-
-        val retVal = simTokens.toDouble() / seq1.size
-        return retVal to paramCount
+        if (includeParams) simTokens += paramCount
+        return packResult(simTokens.toDouble() / n, paramCount)
     }
 
     fun fastMatch(
-        clusterIds: List<Int>,
+        clusterIds: IntArray,
         tokens: List<String>,
         simTh: Double,
         includeParams: Boolean
@@ -289,8 +334,10 @@ class Drain(
         var maxCluster: LogCluster? = null
 
         for (clusterId in clusterIds) {
-            val cluster = idToCluster.get(clusterId) ?: continue
-            val (curSim, paramCount) = getSeqDistance(cluster.logTemplateTokens, tokens, includeParams)
+            val cluster = clusterGet(clusterId) ?: continue
+            val packed = getSeqDistancePacked(cluster.logTemplateTokens, tokens, includeParams)
+            val curSim = unpackSimilarity(packed)
+            val paramCount = unpackParamCount(packed)
             if (curSim > maxSim || (curSim == maxSim && paramCount > maxParamCount)) {
                 maxSim = curSim
                 maxParamCount = paramCount
@@ -302,8 +349,14 @@ class Drain(
     }
 
     fun createTemplate(seq1: List<String>, seq2: List<String>): List<String> {
-        require(seq1.size == seq2.size)
-        return seq1.zip(seq2).map { (t1, t2) -> if (t1 != t2) paramStr else t2 }
+        val n = seq1.size
+        val result = ArrayList<String>(n)
+        for (i in 0 until n) {
+            val t1 = seq1[i]
+            val t2 = seq2[i]
+            result.add(if (t1 != t2) paramStr else t2)
+        }
+        return result
     }
 
     fun printTree(out: Appendable = System.out, maxClusters: Int = 5) {
@@ -325,8 +378,9 @@ class Drain(
             printNode(childToken, child, depth + 1, out, maxClusters)
         }
 
-        for (cid in node.clusterIds.take(maxClusters)) {
-            val cluster = idToCluster.get(cid) ?: continue
+        val limit = minOf(node.clusterIds.size, maxClusters)
+        for (i in 0 until limit) {
+            val cluster = clusterGet(node.clusterIds[i]) ?: continue
             out.appendLine("${"\t".repeat(depth + 1)}$cluster")
         }
     }
@@ -336,7 +390,7 @@ class Drain(
         for (delimiter in extraDelimiters) {
             processed = processed.replace(delimiter, " ")
         }
-        return processed.split("\\s+".toRegex()).filter { it.isNotEmpty() }
+        return processed.split(whitespaceRegex).filterTo(ArrayList(16)) { it.isNotEmpty() }
     }
 
     fun addLogMessage(content: String): Pair<LogCluster, String> {
@@ -353,43 +407,53 @@ class Drain(
             clustersCounter++
             val clusterId = clustersCounter
             matchCluster = LogCluster(contentTokens, clusterId)
-            idToCluster[clusterId] = matchCluster
+            clusterSet(clusterId, matchCluster)
             addSeqToPrefixTree(rootNode, matchCluster)
             updateType = "cluster_created"
         } else {
             profiler.startSection("cluster_exist")
             val newTemplateTokens = createTemplate(contentTokens, matchCluster.logTemplateTokens)
-            if (newTemplateTokens == matchCluster.logTemplateTokens) {
+            if (templatesEqual(newTemplateTokens, matchCluster.logTemplateTokens)) {
                 updateType = "none"
             } else {
                 matchCluster.logTemplateTokens = newTemplateTokens
                 updateType = "cluster_template_changed"
             }
             matchCluster.size++
-            // Touch cluster to update its state in the cache
-            idToCluster.touch(matchCluster.clusterId)
+            clusterTouch(matchCluster.clusterId)
         }
 
         profiler.endSection()
         return matchCluster to updateType
     }
 
-    fun getClustersIdsForSeqLen(seqLen: Int): List<Int> {
-        fun appendClustersRecursive(node: Node, idList: MutableList<Int>) {
-            idList.addAll(node.clusterIds)
-            for (childNode in node.keyToChildNode.values) {
-                appendClustersRecursive(childNode, idList)
-            }
+    /** Fast template equality check — avoids List.equals overhead by checking identity first. */
+    private fun templatesEqual(a: List<String>, b: List<String>): Boolean {
+        if (a === b) return true
+        val n = a.size
+        if (n != b.size) return false
+        for (i in 0 until n) {
+            if (a[i] != b[i]) return false
         }
+        return true
+    }
 
-        val curNode = rootNode.keyToChildNode[seqLen.toString()] ?: return emptyList()
-        val target = mutableListOf<Int>()
+    fun getClustersIdsForSeqLen(seqLen: Int): IntArray {
+        val curNode = rootNode.keyToChildNode[intToString(seqLen)] ?: return IntArray(0)
+        val target = ArrayList<Int>()
         appendClustersRecursive(curNode, target)
-        return target
+        return target.toIntArray()
+    }
+
+    private fun appendClustersRecursive(node: Node, idList: MutableList<Int>) {
+        for (id in node.clusterIds) idList.add(id)
+        for (childNode in node.keyToChildNode.values) {
+            appendClustersRecursive(childNode, idList)
+        }
     }
 
     fun match(content: String, fullSearchStrategy: String = "never"): LogCluster? {
-        require(fullSearchStrategy in listOf("always", "never", "fallback")) {
+        require(fullSearchStrategy in SEARCH_STRATEGIES) {
             "fullSearchStrategy must be one of: always, never, fallback"
         }
 
@@ -413,3 +477,21 @@ class Drain(
 
     fun getTotalClusterSize(): Int = clusters.sumOf { it.size }
 }
+
+// Pack double similarity + int paramCount into a Long to avoid Pair allocation in hot path
+private fun packResult(similarity: Double, paramCount: Int): Long {
+    val simBits = java.lang.Double.doubleToRawLongBits(similarity)
+    // Store paramCount in low 32 bits, similarity bits shifted
+    // Since we only compare, we can use a simpler scheme:
+    // high 32 bits = float bits of similarity, low 32 bits = paramCount
+    val simFloat = similarity.toFloat()
+    val simIntBits = java.lang.Float.floatToRawIntBits(simFloat)
+    return (simIntBits.toLong() shl 32) or (paramCount.toLong() and 0xFFFFFFFFL)
+}
+
+internal fun unpackSimilarity(packed: Long): Double =
+    java.lang.Float.intBitsToFloat((packed ushr 32).toInt()).toDouble()
+
+internal fun unpackParamCount(packed: Long): Int = packed.toInt()
+
+private val SEARCH_STRATEGIES = setOf("always", "never", "fallback")
