@@ -15,13 +15,11 @@ dependencies {
     implementation("com.fasterxml.jackson.core:jackson-databind:2.17.0")
     implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.17.0")
 
-    // Optional persistence backends - consumers add these as needed
-    compileOnly("redis.clients:jedis:5.1.0")
-    compileOnly("org.apache.kafka:kafka-clients:3.7.0")
+    // Redis persistence via Lettuce
+    compileOnly("io.lettuce:lettuce-core:6.3.2.RELEASE")
 
     testImplementation(kotlin("test"))
-    testImplementation("redis.clients:jedis:5.1.0")
-    testImplementation("org.apache.kafka:kafka-clients:3.7.0")
+    testImplementation("io.lettuce:lettuce-core:6.3.2.RELEASE")
 }
 
 java {

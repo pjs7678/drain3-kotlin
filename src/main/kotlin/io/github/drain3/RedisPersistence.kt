@@ -2,8 +2,10 @@
 
 package io.github.drain3
 
-import redis.clients.jedis.Jedis
-import redis.clients.jedis.DefaultJedisClientConfig
+import io.lettuce.core.RedisClient
+import io.lettuce.core.RedisURI
+import io.lettuce.core.api.sync.RedisCommands
+import io.lettuce.core.codec.ByteArrayCodec
 
 class RedisPersistence(
     private val redisHost: String,
@@ -14,22 +16,27 @@ class RedisPersistence(
     private val redisKey: String
 ) : PersistenceHandler {
 
-    private val jedis: Jedis
+    private val commands: RedisCommands<ByteArray, ByteArray>
 
     init {
-        val config = DefaultJedisClientConfig.builder()
-            .database(redisDb)
-            .password(redisPass)
-            .ssl(isSsl)
-            .build()
-        jedis = Jedis(redisHost, redisPort, config)
+        val uriBuilder = RedisURI.builder()
+            .withHost(redisHost)
+            .withPort(redisPort)
+            .withDatabase(redisDb)
+            .withSsl(isSsl)
+        if (redisPass != null) {
+            uriBuilder.withPassword(redisPass.toCharArray())
+        }
+        val client = RedisClient.create(uriBuilder.build())
+        val connection = client.connect(ByteArrayCodec.INSTANCE)
+        commands = connection.sync()
     }
 
     override fun saveState(state: ByteArray) {
-        jedis.set(redisKey.toByteArray(), state)
+        commands.set(redisKey.toByteArray(), state)
     }
 
     override fun loadState(): ByteArray? {
-        return jedis.get(redisKey.toByteArray())
+        return commands.get(redisKey.toByteArray())
     }
 }
